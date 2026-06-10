@@ -43,6 +43,7 @@ services:
       - WITHINGS_CLIENT_ID
       - WITHINGS_CLIENT_SECRET
       - WITHINGS_REDIRECT_URI
+      - WITHINGS_WEBHOOK_URL
       - GARMIN_EMAIL
       - GARMIN_PASSWORD
     restart: unless-stopped
@@ -89,6 +90,7 @@ You will need to configure your credentials in the Web UI.
 3.  **Withings Configuration**:
     -   Copy the **Client ID** and **Secret ID** from the Withings portal and paste them into the corresponding fields.
     -   Click **Save Credentials**.
+    -   Set **Webhook Callback URL** to your public HTTPS endpoint, e.g. `https://<YOUR_DOMAIN>/webhooks/withings`.
 
 ### Step 3: Complete Setup
 
@@ -96,10 +98,19 @@ You will need to configure your credentials in the Web UI.
 2.  You will be redirected to Withings to approve the app. Click **Allow**.
 3.  You will be redirected back to the app with a success message.
 
+### Step 4: Enable Webhook Sync (Recommended)
+
+1. In **Credentials**, click **Subscribe Webhook**.
+2. Verify the badge shows **Webhook: Subscribed**.
+3. The app will then sync only on Withings Body & Weight notifications (`appli=1`).
+
+> **Important**: Withings webhook callbacks must be publicly reachable over **HTTPS**. Localhost/private addresses require a tunnel or reverse proxy.
+
 ## Usage
 
 -   **Sync Now**: On the Home page, click **Sync Now** to immediately check for the latest measurement and upload it to Garmin.
 -   **Schedule**: Set a daily time for the app to automatically check for new weight readings.
+-   **Webhook Sync**: Trigger sync automatically when Withings sends a new weigh-in notification.
 -   **History**: View logs of past sync attempts.
 -   **Historical Sync**: If you have past data you want to import, use the "Historical Import" page to sync data from the last 30+ days.
 

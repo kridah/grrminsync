@@ -7,6 +7,7 @@ import json
 import os
 import atexit
 import time
+import hashlib
 
 # Force immediate log output
 print("DEBUG: Server module loading...", flush=True)
@@ -14,9 +15,10 @@ print("DEBUG: Server module loading...", flush=True)
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import sync_app
+import config
 from datetime import datetime
 import tzlocal
-from config import WITHINGS_CLIENT_ID, WITHINGS_CLIENT_SECRET, WITHINGS_REDIRECT_URI, GARMIN_EMAIL, GARMIN_PASSWORD
+from config import WITHINGS_CLIENT_ID, WITHINGS_CLIENT_SECRET, WITHINGS_REDIRECT_URI, WITHINGS_WEBHOOK_URL, GARMIN_EMAIL, GARMIN_PASSWORD
 
 import sync_historical
 import sqlite3
@@ -91,6 +93,14 @@ def init_db():
             # Ensure table exists if it didn't
             c.execute('''CREATE TABLE IF NOT EXISTS schedule_config
                          (id INTEGER PRIMARY KEY AUTOINCREMENT, hour INTEGER, minute INTEGER, enabled BOOLEAN)''')
+
+            c.execute('''CREATE TABLE IF NOT EXISTS webhook_events
+                         (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                          event_key TEXT UNIQUE,
+                          payload TEXT,
+                          status TEXT,
+                          created_at TEXT,
+                          updated_at TEXT)''')
             
             conn.commit()
         print("DEBUG: Database initialized success.", flush=True)
@@ -128,6 +138,60 @@ def get_schedules():
         c.execute("SELECT id, hour, minute, enabled FROM schedule_config")
         rows = c.fetchall()
         return [dict(row) for row in rows]
+
+def _now_local_timestamp():
+    now_local = datetime.now(tzlocal.get_localzone())
+    return now_local.strftime("%Y-%m-%d %H:%M:%S")
+
+def register_webhook_event(event_key, payload):
+    created_at = _now_local_timestamp()
+    payload_json = json.dumps(payload)
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """INSERT OR IGNORE INTO webhook_events (event_key, payload, status, created_at, updated_at)
+               VALUES (?, ?, 'processing', ?, ?)""",
+            (event_key, payload_json, created_at, created_at)
+        )
+        conn.commit()
+        return c.rowcount == 1
+
+def update_webhook_event_status(event_key, status):
+    updated_at = _now_local_timestamp()
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE webhook_events SET status=?, updated_at=? WHERE event_key=?",
+            (status, updated_at, event_key)
+        )
+        conn.commit()
+
+def get_webhook_event_status(event_key):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT status FROM webhook_events WHERE event_key=?", (event_key,))
+        row = c.fetchone()
+        return row[0] if row else None
+
+def _webhook_event_key(userid, appli, startdate, enddate):
+    raw_key = f"{userid}:{appli}:{startdate}:{enddate}"
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+def process_webhook_sync(startdate, enddate, userid, event_key):
+    status, output = run_sync_logic(
+        target_func=sync_app.sync_webhook_weight_event,
+        startdate=startdate,
+        enddate=enddate,
+        userid=userid
+    )
+    append_history(f"Webhook ({status})", output)
+    if status == "Success":
+        update_webhook_event_status(event_key, "completed")
+    else:
+        update_webhook_event_status(event_key, "failed")
+
+def _get_withings_webhook_url():
+    return config.WITHINGS_WEBHOOK_URL or WITHINGS_WEBHOOK_URL
 
 def append_history(status, log_output):
     """Appends a new entry to the history database, keeping only the last 50."""
@@ -302,7 +366,8 @@ def get_config_status():
         "withings": {
             "configured": withings_configured,
             "authenticated": withings_authenticated,
-            "error": withings_error
+            "error": withings_error,
+            "webhook_url": _get_withings_webhook_url()
         },
         "garmin": {
             "configured": garmin_configured,
@@ -402,6 +467,102 @@ def run_sync():
     append_history(f"Manual ({status})", output)
     
     return jsonify({"status": status, "output": output})
+
+@app.route('/webhooks/withings', methods=['POST', 'GET'])
+def withings_webhook():
+    # Allow basic GET probes from external services/health checks
+    if request.method == 'GET':
+        return jsonify({"status": "ok"}), 200
+
+    payload = {}
+    if request.form:
+        payload = request.form.to_dict()
+    elif request.is_json:
+        payload = request.get_json(silent=True) or {}
+
+    userid = payload.get('userid')
+    appli = payload.get('appli')
+    startdate = payload.get('startdate')
+    enddate = payload.get('enddate')
+
+    if appli is None or startdate is None or enddate is None:
+        return jsonify({"status": "ignored", "message": "Missing required webhook fields"}), 400
+
+    try:
+        appli_int = int(appli)
+        start_int = int(startdate)
+        end_int = int(enddate)
+    except (ValueError, TypeError):
+        return jsonify({"status": "ignored", "message": "Invalid webhook payload values"}), 400
+
+    # Withings body/weight notification category
+    if appli_int != 1:
+        return jsonify({"status": "ignored", "message": "Unsupported notification category"}), 200
+
+    event_key = _webhook_event_key(userid, appli_int, start_int, end_int)
+    if not register_webhook_event(event_key, payload):
+        existing_status = get_webhook_event_status(event_key)
+        return jsonify({"status": "duplicate", "event_status": existing_status}), 200
+
+    t = threading.Thread(
+        target=process_webhook_sync,
+        args=(start_int, end_int, userid, event_key),
+        daemon=True
+    )
+    t.start()
+
+    return jsonify({"status": "accepted", "message": "Webhook processing started"}), 202
+
+@app.route('/withings/webhook/status', methods=['GET'])
+def withings_webhook_status():
+    callback_url = _get_withings_webhook_url()
+    if not callback_url:
+        return jsonify({"configured": False, "subscribed": False, "callback_url": None})
+
+    try:
+        body = sync_app.list_withings_notifications()
+        profiles = body.get('profiles', []) if isinstance(body, dict) else []
+        subscribed = False
+
+        for p in profiles:
+            appli = p.get('appli')
+            cb = p.get('callbackurl')
+            if str(appli) == '1' and cb == callback_url:
+                subscribed = True
+                break
+
+        return jsonify({"configured": True, "subscribed": subscribed, "callback_url": callback_url})
+    except Exception as e:
+        return jsonify({
+            "configured": True,
+            "subscribed": False,
+            "callback_url": callback_url,
+            "error": str(e)
+        }), 200
+
+@app.route('/withings/webhook/subscribe', methods=['POST'])
+def withings_webhook_subscribe():
+    callback_url = _get_withings_webhook_url()
+    if not callback_url:
+        return jsonify({"message": "Webhook callback URL is not configured"}), 400
+
+    try:
+        sync_app.subscribe_withings_notification(callback_url=callback_url, appli=1)
+        return jsonify({"message": "Withings webhook subscription created", "callback_url": callback_url})
+    except Exception as e:
+        return jsonify({"message": f"Failed to subscribe webhook: {str(e)}"}), 500
+
+@app.route('/withings/webhook/unsubscribe', methods=['POST'])
+def withings_webhook_unsubscribe():
+    callback_url = _get_withings_webhook_url()
+    if not callback_url:
+        return jsonify({"message": "Webhook callback URL is not configured"}), 400
+
+    try:
+        sync_app.revoke_withings_notification(callback_url=callback_url, appli=1)
+        return jsonify({"message": "Withings webhook subscription removed", "callback_url": callback_url})
+    except Exception as e:
+        return jsonify({"message": f"Failed to unsubscribe webhook: {str(e)}"}), 500
 
 @app.route('/manual/sync', methods=['POST'])
 def run_manual_sync():
@@ -562,6 +723,7 @@ def save_withings_config():
     client_id = request.form.get('client_id')
     client_secret = request.form.get('client_secret')
     redirect_uri = request.form.get('redirect_uri')
+    webhook_url = request.form.get('webhook_url')
     
     if not client_id or not client_secret:
         return jsonify({"message": "Client ID and Secret are required"}), 400
@@ -581,6 +743,8 @@ def save_withings_config():
         creds["withings_client_secret"] = client_secret
         if redirect_uri:
             creds["withings_redirect_uri"] = redirect_uri
+        if webhook_url is not None:
+            creds["withings_webhook_url"] = webhook_url
         
         with open(creds_path, 'w') as f:
             json.dump(creds, f)
@@ -591,13 +755,17 @@ def save_withings_config():
         config.WITHINGS_CLIENT_SECRET = client_secret
         if redirect_uri:
             config.WITHINGS_REDIRECT_URI = redirect_uri
+        if webhook_url is not None:
+            config.WITHINGS_WEBHOOK_URL = webhook_url
         
         # Also update global imports in this module
-        global WITHINGS_CLIENT_ID, WITHINGS_CLIENT_SECRET, WITHINGS_REDIRECT_URI
+        global WITHINGS_CLIENT_ID, WITHINGS_CLIENT_SECRET, WITHINGS_REDIRECT_URI, WITHINGS_WEBHOOK_URL
         WITHINGS_CLIENT_ID = client_id
         WITHINGS_CLIENT_SECRET = client_secret
         if redirect_uri:
             WITHINGS_REDIRECT_URI = redirect_uri
+        if webhook_url is not None:
+            WITHINGS_WEBHOOK_URL = webhook_url
         
         return jsonify({"message": "Withings Credentials Saved!"})
     except Exception as e:
@@ -783,13 +951,15 @@ def clear_all_credentials():
         config.WITHINGS_CLIENT_ID = ""
         config.WITHINGS_CLIENT_SECRET = ""
         config.WITHINGS_REDIRECT_URI = "http://localhost:5000/auth/withings/callback"
+        config.WITHINGS_WEBHOOK_URL = ""
         config.GARMIN_EMAIL = ""
         config.GARMIN_PASSWORD = ""
         
-        global WITHINGS_CLIENT_ID, WITHINGS_CLIENT_SECRET, WITHINGS_REDIRECT_URI, GARMIN_EMAIL, GARMIN_PASSWORD
+        global WITHINGS_CLIENT_ID, WITHINGS_CLIENT_SECRET, WITHINGS_REDIRECT_URI, WITHINGS_WEBHOOK_URL, GARMIN_EMAIL, GARMIN_PASSWORD
         WITHINGS_CLIENT_ID = ""
         WITHINGS_CLIENT_SECRET = ""
         WITHINGS_REDIRECT_URI = "http://localhost:5000/auth/withings/callback"
+        WITHINGS_WEBHOOK_URL = ""
         GARMIN_EMAIL = ""
         GARMIN_PASSWORD = ""
         
