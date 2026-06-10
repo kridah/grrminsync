@@ -196,6 +196,205 @@ def get_latest_height(access_token):
         print(f"Warning: Could not fetch height. Error type: {type(e).__name__}")
     return None
 
+def get_measuregrps(access_token, startdate=None, enddate=None):
+    """
+    Fetches measure groups from Withings. Optional date filters are Unix timestamps.
+    """
+    url = "https://wbsapi.withings.net/measure"
+    headers = {'Authorization': 'Bearer ' + access_token}
+    params = {'action': 'getmeas'}
+
+    if startdate is not None:
+        params['startdate'] = int(startdate)
+    if enddate is not None:
+        params['enddate'] = int(enddate)
+
+    response = requests.get(url, headers=headers, params=params)
+    if response.status_code != 200:
+        raise Exception(f"Error fetching data from Withings. Status: {response.status_code}")
+
+    data = response.json()
+    if data.get('status') != 0:
+        raise Exception(f"Withings API Error. Status: {data.get('status')}")
+
+    body = data.get('body', {})
+    return body.get('measuregrps', [])
+
+def _extract_weight_payload(group):
+    weight = None
+    fat_ratio = None
+    muscle_mass = None
+    hydration = None
+    bone_mass = None
+    visceral_fat = None
+
+    for measure in group.get('measures', []):
+        val = get_measure_value(measure)
+        type_code = measure.get('type')
+
+        if type_code == 1:
+            weight = val
+        elif type_code == 6:
+            fat_ratio = val
+        elif type_code == 76:
+            muscle_mass = val
+        elif type_code == 77:
+            hydration = val
+        elif type_code == 88:
+            bone_mass = val
+        elif type_code == 12:
+            visceral_fat = val
+
+    return {
+        "weight": weight,
+        "fat_ratio": fat_ratio,
+        "muscle_mass": muscle_mass,
+        "hydration": hydration,
+        "bone_mass": bone_mass,
+        "visceral_fat": visceral_fat
+    }
+
+def sync_weight_range(token_data, garmin_client, startdate, enddate, userid=None):
+    """
+    Syncs only weight/body composition data for a given Withings date range.
+    Used for webhook-triggered syncs.
+    """
+    access_token = token_data['access_token']
+
+    print("\nFetching latest height for BMI calculation...")
+    user_height = get_latest_height(access_token)
+    if user_height:
+        print(f"  Found height: {user_height} m")
+    else:
+        print("  No height found. BMI will not be calculated.")
+
+    print(f"\nFetching webhook range from Withings: start={startdate}, end={enddate}, userid={userid}")
+    measuregrps = get_measuregrps(access_token, startdate=startdate, enddate=enddate)
+
+    if not measuregrps:
+        print("No measures found in webhook range.")
+        return 0
+
+    weight_groups = []
+    for group in measuregrps:
+        has_weight = any(m.get('type') == 1 for m in group.get('measures', []))
+        if has_weight:
+            weight_groups.append(group)
+
+    if not weight_groups:
+        print("Webhook range contains no weight measurements.")
+        return 0
+
+    print(f"Found {len(weight_groups)} weight measurement group(s) in webhook range.")
+
+    # Process oldest -> newest
+    weight_groups.sort(key=lambda g: g.get('date', 0))
+    local_tz = tzlocal.get_localzone()
+    synced = 0
+
+    for idx, group in enumerate(weight_groups):
+        dt = datetime.fromtimestamp(group['date'], timezone.utc)
+        dt_local = dt.astimezone(local_tz)
+        print(f"Processing webhook weight {idx + 1}/{len(weight_groups)} at {dt_local.isoformat()}...")
+
+        payload = _extract_weight_payload(group)
+        weight = payload["weight"]
+        if not weight:
+            print("  Skipping group (No weight found).")
+            continue
+
+        percent_hydration = None
+        if payload["hydration"] and weight:
+            percent_hydration = (payload["hydration"] / weight) * 100
+
+        bmi = None
+        if user_height:
+            bmi = weight / (user_height * user_height)
+
+        garmin_client.add_body_composition(
+            timestamp=dt_local.isoformat(),
+            weight=weight,
+            percent_fat=payload["fat_ratio"],
+            percent_hydration=percent_hydration,
+            visceral_fat_rating=payload["visceral_fat"],
+            bone_mass=payload["bone_mass"],
+            muscle_mass=payload["muscle_mass"],
+            bmi=bmi
+        )
+        synced += 1
+        print("  Successfully synced webhook weight to Garmin.")
+
+    return synced
+
+def _withings_notify_request(access_token, action, **kwargs):
+    url = "https://wbsapi.withings.net/notify"
+    headers = {'Authorization': 'Bearer ' + access_token}
+    data = {'action': action}
+    data.update(kwargs)
+
+    response = requests.post(url, headers=headers, data=data, timeout=20)
+    if response.status_code != 200:
+        raise Exception(f"Withings notify HTTP error: {response.status_code}")
+
+    payload = response.json()
+    if payload.get('status') != 0:
+        raise Exception(f"Withings notify API error: {payload}")
+
+    return payload.get('body', {})
+
+def list_withings_notifications(token_data=None):
+    token_data = token_data or authenticate_withings()
+    return _withings_notify_request(token_data['access_token'], 'list')
+
+def subscribe_withings_notification(callback_url, appli=1, comment='grrminsync webhook'):
+    token_data = authenticate_withings()
+    return _withings_notify_request(
+        token_data['access_token'],
+        'subscribe',
+        callbackurl=callback_url,
+        appli=appli,
+        comment=comment
+    )
+
+def revoke_withings_notification(callback_url, appli=1):
+    token_data = authenticate_withings()
+    return _withings_notify_request(
+        token_data['access_token'],
+        'revoke',
+        callbackurl=callback_url,
+        appli=appli
+    )
+
+def sync_webhook_weight_event(startdate, enddate, userid=None):
+    if not config.WITHINGS_CLIENT_ID or not config.WITHINGS_CLIENT_SECRET:
+        print("Error: Withings Credentials not found. Please configure your Withings credentials.")
+        return
+
+    if not config.GARMIN_EMAIL or not config.GARMIN_PASSWORD:
+        print("Error: Garmin Credentials not found. Please configure your Garmin credentials.")
+        return
+
+    print("Connecting to Withings...")
+    token_data = authenticate_withings()
+
+    print("Connecting to Garmin...")
+    token_dir = os.path.join(DATA_DIR, '.garminconnect')
+    os.makedirs(token_dir, exist_ok=True)
+    garmin = Garmin(config.GARMIN_EMAIL, config.GARMIN_PASSWORD)
+    try:
+        garmin.login(tokenstore=token_dir)
+    except Exception:
+        garmin.login(email=config.GARMIN_EMAIL, tokenstore=token_dir, **{'password': config.GARMIN_PASSWORD})
+
+    synced = sync_weight_range(
+        token_data=token_data,
+        garmin_client=garmin,
+        startdate=startdate,
+        enddate=enddate,
+        userid=userid
+    )
+    print(f"Webhook sync complete. Synced weight entries: {synced}")
+
 def sync_data(token_data, garmin_client):
     access_token = token_data['access_token']
     

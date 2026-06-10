@@ -32,6 +32,9 @@ WITHINGS_REDIRECT_URI = get_credential('WITHINGS_REDIRECT_URI', 'withings_redire
 if not WITHINGS_REDIRECT_URI:
     WITHINGS_REDIRECT_URI = 'http://localhost:5000/auth/withings/callback'
 
+# Public webhook callback URL for Withings notifications
+WITHINGS_WEBHOOK_URL = get_credential('WITHINGS_WEBHOOK_URL', 'withings_webhook_url')
+
 # Garmin Credentials
 GARMIN_EMAIL = get_credential('GARMIN_EMAIL', 'garmin_email')
 GARMIN_PASSWORD = get_credential('GARMIN_PASSWORD', 'garmin_password')
