@@ -533,11 +533,12 @@ def withings_webhook_status():
 
         return jsonify({"configured": True, "subscribed": subscribed, "callback_url": callback_url})
     except Exception as e:
+        print(f"Webhook status check failed: {type(e).__name__}", flush=True)
         return jsonify({
             "configured": True,
             "subscribed": False,
             "callback_url": callback_url,
-            "error": str(e)
+            "error": "Unable to fetch webhook subscription status"
         }), 200
 
 @app.route('/withings/webhook/subscribe', methods=['POST'])
@@ -550,7 +551,8 @@ def withings_webhook_subscribe():
         sync_app.subscribe_withings_notification(callback_url=callback_url, appli=1)
         return jsonify({"message": "Withings webhook subscription created", "callback_url": callback_url})
     except Exception as e:
-        return jsonify({"message": f"Failed to subscribe webhook: {str(e)}"}), 500
+        print(f"Webhook subscribe failed: {type(e).__name__}", flush=True)
+        return jsonify({"message": "Failed to subscribe webhook"}), 500
 
 @app.route('/withings/webhook/unsubscribe', methods=['POST'])
 def withings_webhook_unsubscribe():
@@ -562,7 +564,8 @@ def withings_webhook_unsubscribe():
         sync_app.revoke_withings_notification(callback_url=callback_url, appli=1)
         return jsonify({"message": "Withings webhook subscription removed", "callback_url": callback_url})
     except Exception as e:
-        return jsonify({"message": f"Failed to unsubscribe webhook: {str(e)}"}), 500
+        print(f"Webhook unsubscribe failed: {type(e).__name__}", flush=True)
+        return jsonify({"message": "Failed to unsubscribe webhook"}), 500
 
 @app.route('/manual/sync', methods=['POST'])
 def run_manual_sync():
